@@ -27,16 +27,30 @@ export default function Home() {
     if (savedCredentials) {
       try {
         const credentials = JSON.parse(savedCredentials);
+        console.log('Loaded credentials from localStorage:', { 
+          accountSid: credentials.accountSid || 'undefined',
+          apiKey: credentials.apiKey || 'undefined', 
+          apiSecret: credentials.apiSecret ? '***' : 'undefined', 
+          appSid: credentials.appSid || 'undefined'
+        });
+        
         setAccountSid(credentials.accountSid || '');
         setApiKey(credentials.apiKey || '');
         setApiSecret(credentials.apiSecret || '');
         setAppSid(credentials.appSid || '');
         
-        // If all credentials are present, mark as configured
+        // If all credentials are present and valid, mark as configured
         if (credentials.accountSid && credentials.apiKey && credentials.apiSecret && credentials.appSid) {
+          // Check if credentials are not placeholder values
+          if (credentials.accountSid === '***' || credentials.apiKey === '***' || credentials.appSid === '***') {
+            console.log('Detected placeholder credentials, clearing them');
+            clearInvalidCredentials();
+            return;
+          }
+          
           setIsConfigured(true);
           setStatusMessage('Ready to call');
-          initializeDevice();
+          // Don't call initializeDevice here - wait for user to click Configure
         } else {
           // Show form if credentials are incomplete
           setShowConfigForm(true);
@@ -78,12 +92,53 @@ export default function Home() {
     localStorage.removeItem('twilioCredentials');
   };
 
+  const areCredentialsComplete = () => {
+    const hasAllFields = accountSid?.trim() && apiKey?.trim() && apiSecret?.trim() && appSid?.trim();
+    
+    if (!hasAllFields) return false;
+    
+    // Basic format validation for Twilio credentials
+    const isValidAccountSid = accountSid.trim().startsWith('AC') && accountSid.trim().length > 20;
+    const isValidApiKey = apiKey.trim().startsWith('SK') && apiKey.trim().length > 20;
+    const isValidAppSid = appSid.trim().startsWith('AP') && appSid.trim().length > 20;
+    
+    return isValidAccountSid && isValidApiKey && isValidAppSid;
+  };
+
+  const clearInvalidCredentials = () => {
+    console.log('Clearing invalid credentials from localStorage');
+    localStorage.removeItem('twilioCredentials');
+    setAccountSid('');
+    setApiKey('');
+    setApiSecret('');
+    setAppSid('');
+    setIsConfigured(false);
+    setShowConfigForm(true);
+    setStatusMessage('Please enter valid Twilio credentials');
+  };
+
   const initializeDevice = async () => {
+    // Validate credentials before proceeding
+    if (!areCredentialsComplete()) {
+      setStatusMessage('Missing Twilio credentials. Please configure first.');
+      setCallStatus('error');
+      return;
+    }
+
+    // Prevent multiple initializations
+    if (deviceRef.current) {
+      console.log('Device already initialized, destroying previous instance');
+      deviceRef.current.destroy();
+      deviceRef.current = null;
+    }
+
     try {
       setIsLoading(true);
       setStatusMessage('Initializing Twilio Device...');
       
       // Get access token from our API with credentials
+      console.log('Getting access token with validated credentials');
+      
       const response = await fetch('/api/token', {
         method: 'POST',
         headers: {
@@ -99,10 +154,18 @@ export default function Home() {
 
       if (!response.ok) {
         const errorData = await response.json();
-        throw new Error(errorData.error || 'Failed to get access token');
+        console.error('API Error Response:', errorData);
+        throw new Error(errorData.error || `Failed to get access token: ${response.status} ${response.statusText}`);
       }
 
-      const { token } = await response.json();
+      const responseData = await response.json();
+      console.log('API Response received:', { token: responseData.token ? '***' : 'undefined', identity: responseData.identity });
+      
+      if (!responseData.token) {
+        throw new Error('No token received from API');
+      }
+      
+      const { token } = responseData;
       
       // Initialize the Twilio Device
       const device = new Device(token, {
@@ -115,6 +178,7 @@ export default function Home() {
         console.log('Twilio Device registered');
         setStatusMessage('Device ready - Click to call agent');
         setIsLoading(false);
+        setCallStatus('idle'); // Ensure call status is reset
       });
 
       device.on('error', (error) => {
@@ -141,19 +205,56 @@ export default function Home() {
     }
   };
 
-  const handleConfigure = () => {
-    if (!accountSid || !apiKey || !apiSecret || !appSid) {
+  const handleConfigure = async () => {
+    if (!areCredentialsComplete()) {
       setStatusMessage('Please fill in all Twilio credentials');
       return;
     }
     
-    // Save credentials to localStorage
-    saveCredentialsToStorage();
+    console.log('Configuring with credentials:', { 
+      accountSid: accountSid || 'undefined',
+      apiKey: apiKey || 'undefined', 
+      apiSecret: apiSecret ? '***' : 'undefined', 
+      appSid: appSid || 'undefined'
+    });
     
-    setIsConfigured(true);
-    setShowConfigForm(false);
-    setStatusMessage('Ready to call');
-    initializeDevice();
+    // Test credentials first before saving
+    setIsLoading(true);
+    setStatusMessage('Testing credentials...');
+    
+    try {
+      const response = await fetch('/api/token', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          accountSid,
+          apiKey,
+          apiSecret,
+          appSid
+        })
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || `Failed to test credentials: ${response.status}`);
+      }
+
+      // Credentials are valid, save them
+      saveCredentialsToStorage();
+      setIsConfigured(true);
+      setShowConfigForm(false);
+      setStatusMessage('Credentials validated! Ready to call');
+      
+      // Initialize device
+      initializeDevice();
+      
+    } catch (error) {
+      console.error('Credential validation failed:', error);
+      setStatusMessage(`Credential validation failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      setIsLoading(false);
+    }
   };
 
   const resetConfiguration = () => {
@@ -346,7 +447,7 @@ export default function Home() {
   };
 
   const isButtonDisabled = () => {
-    return isLoading || callStatus === 'connecting' || callStatus === 'call-ended' || !isConfigured;
+    return isLoading || callStatus === 'connecting' || callStatus === 'call-ended' || !isConfigured || !areCredentialsComplete();
   };
 
   const handleButtonClick = () => {
@@ -396,6 +497,11 @@ export default function Home() {
                 </svg>
                 Configure Twilio
               </h2>
+              <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                <p className="text-sm text-blue-800">
+                  <strong>Note:</strong> You need valid Twilio credentials. Account SID starts with "AC", API Key starts with "SK", and Application SID starts with "AP".
+                </p>
+              </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
                   <label htmlFor="accountSid" className="block text-sm font-semibold text-gray-700 mb-2">
@@ -406,9 +512,16 @@ export default function Home() {
                     id="accountSid"
                     value={accountSid}
                     onChange={(e) => setAccountSid(e.target.value)}
-                    className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:outline-none focus:ring-4 focus:ring-blue-300 focus:border-blue-500 transition-all duration-200 bg-white"
-                    placeholder="Enter Account SID"
+                    className={`w-full px-4 py-3 border-2 rounded-xl focus:outline-none focus:ring-4 transition-all duration-200 bg-white ${
+                      accountSid && !accountSid.trim().startsWith('AC') 
+                        ? 'border-red-300 focus:ring-red-300 focus:border-red-500' 
+                        : 'border-gray-200 focus:ring-blue-300 focus:border-blue-500'
+                    }`}
+                    placeholder="Enter Account SID (starts with AC)"
                   />
+                  {accountSid && !accountSid.trim().startsWith('AC') && (
+                    <p className="text-xs text-red-600 mt-1">Account SID should start with "AC"</p>
+                  )}
                 </div>
                 <div>
                   <label htmlFor="apiKey" className="block text-sm font-semibold text-gray-700 mb-2">
@@ -419,9 +532,16 @@ export default function Home() {
                     id="apiKey"
                     value={apiKey}
                     onChange={(e) => setApiKey(e.target.value)}
-                    className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:outline-none focus:ring-4 focus:ring-blue-300 focus:border-blue-500 transition-all duration-200 bg-white"
-                    placeholder="Enter API Key"
+                    className={`w-full px-4 py-3 border-2 rounded-xl focus:outline-none focus:ring-4 transition-all duration-200 bg-white ${
+                      apiKey && !apiKey.trim().startsWith('SK') 
+                        ? 'border-red-300 focus:ring-red-300 focus:border-red-500' 
+                        : 'border-gray-200 focus:ring-blue-300 focus:border-blue-500'
+                    }`}
+                    placeholder="Enter API Key (starts with SK)"
                   />
+                  {apiKey && !apiKey.trim().startsWith('SK') && (
+                    <p className="text-xs text-red-600 mt-1">API Key should start with "SK"</p>
+                  )}
                 </div>
                 <div>
                   <label htmlFor="apiSecret" className="block text-sm font-semibold text-gray-700 mb-2">
@@ -445,9 +565,16 @@ export default function Home() {
                     id="appSid"
                     value={appSid}
                     onChange={(e) => setAppSid(e.target.value)}
-                    className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:outline-none focus:ring-4 focus:ring-blue-300 focus:border-blue-500 transition-all duration-200 bg-white"
-                    placeholder="Enter Application SID"
+                    className={`w-full px-4 py-3 border-2 rounded-xl focus:outline-none focus:ring-4 transition-all duration-200 bg-white ${
+                      appSid && !appSid.trim().startsWith('AP') 
+                        ? 'border-red-300 focus:ring-red-300 focus:border-red-500' 
+                        : 'border-gray-200 focus:ring-blue-300 focus:border-blue-500'
+                    }`}
+                    placeholder="Enter Application SID (starts with AP)"
                   />
+                  {appSid && !appSid.trim().startsWith('AP') && (
+                    <p className="text-xs text-red-600 mt-1">Application SID should start with "AP"</p>
+                  )}
                 </div>
               </div>
               <button
@@ -549,10 +676,21 @@ export default function Home() {
                 className="w-full py-3 px-4 bg-gradient-to-r from-red-500 to-red-600 text-white rounded-xl font-semibold hover:from-red-600 hover:to-red-700 focus:outline-none focus:ring-4 focus:ring-red-300 focus:ring-opacity-50 transition-all duration-200 shadow-md hover:shadow-lg transform hover:-translate-y-0.5"
               >
                 <div className="flex items-center justify-center">
-                  <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 0 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                   </svg>
                   Reset Configuration
+                </div>
+              </button>
+              <button
+                onClick={clearInvalidCredentials}
+                className="w-full py-3 px-4 bg-gradient-to-r from-orange-500 to-orange-600 text-white rounded-xl font-semibold hover:from-orange-600 hover:to-orange-700 focus:outline-none focus:ring-4 focus:ring-orange-300 focus:ring-opacity-50 transition-all duration-200 shadow-md hover:shadow-lg transform hover:-translate-y-0.5"
+              >
+                <div className="flex items-center justify-center">
+                  <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.732 16.5c-.77.833.192 2.5 1.732 2.5z" />
+                  </svg>
+                  Clear Invalid Credentials
                 </div>
               </button>
             </div>
